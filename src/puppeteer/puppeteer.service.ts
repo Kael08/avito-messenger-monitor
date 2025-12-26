@@ -13,7 +13,7 @@ export class PuppeteerService implements OnModuleDestroy {
 
   constructor(private readonly messagesService: MessagesService) {}
 
-  async startMonitoring(): Promise<void> {
+  async startMonitoring(phone?: string, password?: string, smsCode?: string): Promise<{ requiresSms: boolean; error?: string }> {
     if (this.isRunning) {
       this.logger.warn('Monitoring is already running');
       return;
@@ -51,87 +51,146 @@ export class PuppeteerService implements OnModuleDestroy {
       }
       await this.page.waitForTimeout(3000);
 
-      // Автоматически открываем форму логина
-      this.logger.log('Opening login form...');
-      try {
-        // Пробуем открыть форму логина через hash
-        await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000,
-        });
-        await this.page.waitForTimeout(2000);
+      // Если переданы телефон и пароль, выполняем автоматическую авторизацию
+      let isAlreadyLoggedIn = false;
+      if (phone && password) {
+        this.logger.log('═══════════════════════════════════════════════════════');
+        this.logger.log('🔐 Выполняется автоматическая авторизация...');
+        this.logger.log('═══════════════════════════════════════════════════════');
         
-        // Если форма не открылась, пробуем кликнуть на кнопку "Войти"
-        const currentUrl = this.page.url();
-        if (!currentUrl.includes('#login')) {
-          this.logger.log('Login form not opened via hash, trying to click login button...');
+        try {
+          const loginResult = await this.login(phone, password, smsCode);
           
-          const loginButtonSelectors = [
-            'a[href*="login"]',
-            'a[href*="#login"]',
-            '[data-marker*="login"]',
-            'button:has-text("Войти")',
-          ];
+          if (loginResult.error) {
+            this.logger.error(`Ошибка авторизации: ${loginResult.error}`);
+            return loginResult;
+          }
           
-          let loginButtonClicked = false;
-          for (const selector of loginButtonSelectors) {
-            try {
-              const buttons = await this.page.$$(selector);
-              for (const button of buttons) {
-                const text = await this.page.evaluate((el) => el.textContent?.toLowerCase() || '', button);
-                const href = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('href') || '', button);
-                
-                if (text.includes('войти') || text.includes('вход') || text.includes('login') || href?.includes('login')) {
-                  this.logger.log(`Found login button, clicking...`);
-                  await button.click();
-                  await this.page.waitForTimeout(2000);
-                  loginButtonClicked = true;
-                  break;
+          if (loginResult.requiresSms) {
+            this.logger.log('⚠️ Требуется SMS-код');
+            return loginResult;
+          }
+          
+          this.logger.log('✅ Авторизация выполнена успешно!');
+          // Проверяем, что авторизация действительно прошла
+          isAlreadyLoggedIn = await this.checkIfLoggedIn();
+          if (isAlreadyLoggedIn) {
+            this.logger.log('✅ Авторизация подтверждена, переходим к мессенджеру');
+          } else {
+            return { requiresSms: false, error: 'Авторизация не подтверждена' };
+          }
+        } catch (error) {
+          this.logger.error('Ошибка при автоматической авторизации:', error);
+          return { requiresSms: false, error: error.message || 'Ошибка при авторизации' };
+        }
+      } else {
+        // Если данные не переданы, ожидаем ручную авторизацию
+        this.logger.log('═══════════════════════════════════════════════════════');
+        this.logger.log('⏳ Ожидание ручной авторизации...');
+        this.logger.log('📝 Пожалуйста, авторизуйтесь в Авито в открывшемся браузере');
+        this.logger.log('═══════════════════════════════════════════════════════');
+        isAlreadyLoggedIn = await this.checkIfLoggedIn();
+      }
+
+      // Автоматически открываем форму логина (если еще не авторизованы)
+      if (!isAlreadyLoggedIn) {
+        this.logger.log('Opening login form...');
+        try {
+          // Пробуем открыть форму логина через hash
+          await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          });
+          await this.page.waitForTimeout(2000);
+          
+          // Если форма не открылась, пробуем кликнуть на кнопку "Войти"
+          const currentUrl = this.page.url();
+          if (!currentUrl.includes('#login')) {
+            this.logger.log('Login form not opened via hash, trying to click login button...');
+            
+            const loginButtonSelectors = [
+              'a[href*="login"]',
+              'a[href*="#login"]',
+              '[data-marker*="login"]',
+              'button:has-text("Войти")',
+            ];
+            
+            let loginButtonClicked = false;
+            for (const selector of loginButtonSelectors) {
+              try {
+                const buttons = await this.page.$$(selector);
+                for (const button of buttons) {
+                  const text = await this.page.evaluate((el) => el.textContent?.toLowerCase() || '', button);
+                  const href = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('href') || '', button);
+                  
+                  if (text.includes('войти') || text.includes('вход') || text.includes('login') || href?.includes('login')) {
+                    this.logger.log(`Found login button, clicking...`);
+                    await button.click();
+                    await this.page.waitForTimeout(2000);
+                    loginButtonClicked = true;
+                    break;
+                  }
                 }
+                if (loginButtonClicked) break;
+              } catch (e) {
+                continue;
               }
-              if (loginButtonClicked) break;
-            } catch (e) {
-              continue;
+            }
+          }
+        } catch (error) {
+          this.logger.warn('Error opening login form:', error);
+        }
+
+        // Если автоматическая авторизация не была выполнена, ждем ручную
+        if (!phone || !password) {
+          // Ждем до 5 минут, проверяя каждые 5 секунд, авторизовался ли пользователь
+          let isLoggedIn = false;
+          const maxWaitTime = 300; // 5 минут в секундах
+          const checkInterval = 5; // проверяем каждые 5 секунд
+          let waitedTime = 0;
+          
+          while (!isLoggedIn && waitedTime < maxWaitTime) {
+            await this.page.waitForTimeout(checkInterval * 1000);
+            waitedTime += checkInterval;
+            
+            try {
+              isLoggedIn = await this.checkIfLoggedIn();
+              if (isLoggedIn) {
+                this.logger.log('✅ Пользователь авторизован! Продолжаем...');
+                break;
+              }
+              
+              if (waitedTime % 30 === 0) { // Каждые 30 секунд выводим сообщение
+                this.logger.log(`⏳ Ожидание авторизации... (${waitedTime}/${maxWaitTime} секунд)`);
+              }
+            } catch (error) {
+              this.logger.debug('Error checking login status:', error);
+            }
+          }
+          
+          if (!isLoggedIn) {
+            throw new Error('Авторизация не выполнена в течение 5 минут. Пожалуйста, авторизуйтесь и попробуйте снова.');
+          }
+        } else {
+          // Проверяем, что автоматическая авторизация прошла успешно
+          await this.page.waitForTimeout(3000);
+          const isLoggedIn = await this.checkIfLoggedIn();
+          if (!isLoggedIn) {
+            this.logger.warn('Автоматическая авторизация не подтверждена, ожидание ручной авторизации...');
+            // Ждем еще немного для ручной авторизации, если автоматическая не сработала
+            let waitedTime = 0;
+            const maxWaitTime = 120; // 2 минуты
+            while (waitedTime < maxWaitTime) {
+              await this.page.waitForTimeout(5000);
+              waitedTime += 5;
+              const loggedIn = await this.checkIfLoggedIn();
+              if (loggedIn) {
+                this.logger.log('✅ Авторизация подтверждена!');
+                break;
+              }
             }
           }
         }
-      } catch (error) {
-        this.logger.warn('Error opening login form:', error);
-      }
-
-      // Ждем ручной авторизации пользователя
-      this.logger.log('═══════════════════════════════════════════════════════');
-      this.logger.log('⏳ Ожидание ручной авторизации...');
-      this.logger.log('📝 Пожалуйста, авторизуйтесь в Авито в открывшемся браузере');
-      this.logger.log('═══════════════════════════════════════════════════════');
-      
-      // Ждем до 5 минут, проверяя каждые 5 секунд, авторизовался ли пользователь
-      let isLoggedIn = false;
-      const maxWaitTime = 300; // 5 минут в секундах
-      const checkInterval = 5; // проверяем каждые 5 секунд
-      let waitedTime = 0;
-      
-      while (!isLoggedIn && waitedTime < maxWaitTime) {
-        await this.page.waitForTimeout(checkInterval * 1000);
-        waitedTime += checkInterval;
-        
-        try {
-          isLoggedIn = await this.checkIfLoggedIn();
-          if (isLoggedIn) {
-            this.logger.log('✅ Пользователь авторизован! Продолжаем...');
-            break;
-          }
-          
-          if (waitedTime % 30 === 0) { // Каждые 30 секунд выводим сообщение
-            this.logger.log(`⏳ Ожидание авторизации... (${waitedTime}/${maxWaitTime} секунд)`);
-          }
-        } catch (error) {
-          this.logger.debug('Error checking login status:', error);
-        }
-      }
-      
-      if (!isLoggedIn) {
-        throw new Error('Авторизация не выполнена в течение 5 минут. Пожалуйста, авторизуйтесь и попробуйте снова.');
       }
 
       // Переходим в мессенджер если не находимся там
@@ -172,10 +231,12 @@ export class PuppeteerService implements OnModuleDestroy {
         sender: 'Система',
         timestamp: new Date().toISOString(),
       });
+      
+      return { requiresSms: false };
     } catch (error) {
       this.logger.error('Error starting monitoring:', error);
       await this.cleanup();
-      throw error;
+      return { requiresSms: false, error: error.message || 'Ошибка при запуске мониторинга' };
     }
   }
 
@@ -226,768 +287,375 @@ export class PuppeteerService implements OnModuleDestroy {
     }
   }
 
-  private async login(phone: string, password: string): Promise<void> {
+  private async login(phone: string, password: string, smsCode?: string): Promise<{ requiresSms: boolean; error?: string }> {
     if (!this.page) throw new Error('Page is not initialized');
 
     try {
       // Авито использует hash routing для формы логина (#login)
       // Переходим на главную страницу с hash для открытия формы логина
-      this.logger.log('Navigating to login page with hash routing...');
+      this.logger.log('Navigating to login page...');
       try {
         await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
-          waitUntil: 'networkidle2',
-          timeout: 60000,
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
         });
       } catch (error) {
-        this.logger.warn('Navigation with networkidle2 failed, trying with load...');
-        try {
-          await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
-            waitUntil: 'load',
-            timeout: 60000,
-          });
-        } catch (e2) {
-          this.logger.warn('Navigation with load failed, trying with domcontentloaded...');
-          await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-          });
-        }
+        this.logger.warn('Navigation failed, retrying...');
+        await this.page.goto('https://www.avito.ru/#login?authsrc=h', {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        });
       }
       
-      // Ждем полной загрузки страницы
-      await this.page.waitForTimeout(3000);
+      // Минимальное ожидание для загрузки формы
+      await this.page.waitForTimeout(1000);
       
-      // Логируем текущий URL для отладки
-      let currentUrl = this.page.url();
-      this.logger.log(`Current URL after navigation: ${currentUrl}`);
-      
-      // Если форма логина не открылась через hash, пробуем кликнуть на кнопку "Войти"
-      if (!currentUrl.includes('#login')) {
-        this.logger.log('Login form not opened via hash, trying to click login button...');
-        
-        // Ищем кнопку "Войти" или "Вход и регистрация"
-        const loginButtonSelectors = [
-          'a[href*="login"]',
-          'a[href*="#login"]',
-          'button:has-text("Войти")',
-          '[data-marker*="login"]',
-          '[data-marker*="Login"]',
-        ];
-        
-        let loginButtonClicked = false;
-        for (const selector of loginButtonSelectors) {
-          try {
-            const buttons = await this.page.$$(selector);
-            for (const button of buttons) {
-              const text = await this.page.evaluate((el) => el.textContent?.toLowerCase() || '', button);
-              const href = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('href') || '', button);
-              
-              if (text.includes('войти') || text.includes('вход') || text.includes('login') || href?.includes('login')) {
-                this.logger.log(`Found login button with selector: ${selector}, text: ${text}, href: ${href}`);
-                await button.click();
-                await this.page.waitForTimeout(3000);
-                loginButtonClicked = true;
-                
-                currentUrl = this.page.url();
-                this.logger.log(`Current URL after clicking login button: ${currentUrl}`);
-                break;
-              }
-            }
-            if (loginButtonClicked) break;
-          } catch (e) {
-            continue;
-          }
-        }
-        
-        // Если не нашли кнопку через селекторы, пробуем найти через текст
-        if (!loginButtonClicked) {
-          try {
-            const allLinks = await this.page.$$('a');
-            for (const link of allLinks) {
-              const text = await this.page.evaluate((el) => el.textContent?.toLowerCase() || '', link);
-              const href = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('href') || '', link);
-              
-              if ((text.includes('войти') || text.includes('вход') || href?.includes('login')) && !text.includes('регистрация')) {
-                this.logger.log(`Found login link by text: ${text}, href: ${href}`);
-                await link.click();
-                await this.page.waitForTimeout(3000);
-                loginButtonClicked = true;
-                
-                currentUrl = this.page.url();
-                this.logger.log(`Current URL after clicking login link: ${currentUrl}`);
-                break;
-              }
-            }
-          } catch (e) {
-            this.logger.warn('Error searching for login link:', e);
-          }
-        }
-      }
-      
-      // Дополнительное ожидание для загрузки формы логина через JavaScript
-      await this.page.waitForTimeout(3000);
-      
-      // Пробуем дождаться появления формы логина (input поля)
-      this.logger.log('Waiting for login form to appear...');
-      try {
-        // Ждем появления любого input поля (форма логина должна содержать input)
-        await this.page.waitForSelector('input', { timeout: 15000 });
-        this.logger.log('Input elements detected on page');
-      } catch (e) {
-        this.logger.warn('No input elements found, but continuing...');
-      }
-      
-      // Дополнительное ожидание для динамической загрузки формы
-      await this.page.waitForTimeout(2000);
-      
-      currentUrl = this.page.url();
-      this.logger.log(`Final URL: ${currentUrl}`);
-
       // Проверяем, не авторизованы ли мы уже
+      const currentUrl = this.page.url();
       if (currentUrl.includes('/profile') || currentUrl.includes('/cabinet') || currentUrl.includes('/messenger')) {
         this.logger.log('Already logged in');
         return;
       }
 
-      // Ждем появления формы логина - пробуем разные селекторы для модального окна или формы
-      this.logger.log('Waiting for login form to fully load...');
-      const formSelectors = [
-        '[class*="modal"]',
-        '[class*="Modal"]',
-        '[class*="dialog"]',
-        '[class*="Dialog"]',
-        '[class*="popup"]',
-        '[class*="Popup"]',
-        '[class*="auth"]',
-        '[class*="Auth"]',
-        '[class*="login"]',
-        '[class*="Login"]',
-        'form',
-      ];
-      
-      let formFound = false;
-      for (const selector of formSelectors) {
+      // Ждем появления формы логина - используем точные селекторы из логов
+      this.logger.log('Waiting for login form...');
+      try {
+        // Используем точные селекторы, которые мы знаем из логов
+        await this.page.waitForSelector('input[data-marker="login-form/login/input"]', { 
+          timeout: 10000, 
+          visible: true 
+        });
+        this.logger.log('Login form detected');
+      } catch (e) {
+        // Если не нашли по data-marker, пробуем альтернативные селекторы
         try {
-          await this.page.waitForSelector(selector, { timeout: 5000 });
-          this.logger.log(`Found form container with selector: ${selector}`);
-          formFound = true;
-          break;
-        } catch (e) {
-          continue;
+          await this.page.waitForSelector('input[name="login"], input[placeholder*="Телефон"], input[placeholder*="телефон"]', { 
+            timeout: 5000, 
+            visible: true 
+          });
+        } catch (e2) {
+          this.logger.warn('Login form not found, but continuing...');
         }
       }
       
-      if (!formFound) {
-        this.logger.warn('No form container found, but continuing...');
-      }
-      
-      // Дополнительное ожидание для полной загрузки формы
-      await this.page.waitForTimeout(3000);
-      
-      // Пробуем прокрутить страницу наверх, если форма в модальном окне
-      try {
-        await this.page.evaluate(() => {
-          window.scrollTo(0, 0);
-        });
-        await this.page.waitForTimeout(1000);
-      } catch (e) {
-        // Игнорируем ошибки прокрутки
-      }
-      
-      // Сначала получаем все input поля для анализа
-      this.logger.log('Analyzing page inputs...');
-      const allInputs = await this.page.evaluate(() => {
-        const inputs = Array.from(document.querySelectorAll('input'));
-        return inputs.map(input => ({
-          type: input.type,
-          name: input.name,
-          id: input.id,
-          placeholder: input.placeholder,
-          className: input.className,
-          autocomplete: input.getAttribute('autocomplete'),
-          'data-marker': input.getAttribute('data-marker'),
-          'data-test-id': input.getAttribute('data-test-id'),
-          visible: input.offsetWidth > 0 && input.offsetHeight > 0,
-          parentTag: input.parentElement?.tagName,
-          parentClass: input.parentElement?.className,
-        }));
-      });
-      this.logger.log('Available inputs on page:', JSON.stringify(allInputs, null, 2));
+      // Минимальное ожидание для полной загрузки формы
+      await this.page.waitForTimeout(500);
 
-      // Множественные варианты селекторов для поля телефона
+      // Используем точные селекторы для быстрого поиска полей
+      // Приоритет: data-marker > name > placeholder
       const phoneSelectors = [
-        'input[type="tel"]',
-        'input[name="phone"]',
-        'input[id*="phone"]',
-        'input[id*="Phone"]',
-        'input[placeholder*="телефон"]',
+        'input[data-marker="login-form/login/input"]',
+        'input[name="login"]',
         'input[placeholder*="Телефон"]',
-        'input[placeholder*="PHONE"]',
-        'input[placeholder*="Phone"]',
-        'input[autocomplete="tel"]',
-        'input[autocomplete*="tel"]',
-        'input[data-marker*="phone"]',
-        'input[data-marker*="Phone"]',
-        'input[data-test-id*="phone"]',
-        'input.input-input-3rFv2',
-        'input[class*="input"]',
+        'input[placeholder*="телефон"]',
+        'input[type="tel"]',
+        'input[autocomplete="username"]',
       ];
 
       let phoneInput = null;
-      let foundSelector = '';
-
-      // Пробуем найти поле телефона разными селекторами
-      // Сначала пробуем дождаться появления поля с таймаутом
+      
+      // Быстро находим поле телефона
       for (const selector of phoneSelectors) {
         try {
-          this.logger.log(`Trying selector: ${selector}`);
-          // Пробуем дождаться появления элемента
-          try {
-            await this.page.waitForSelector(selector, { timeout: 3000, visible: true });
-          } catch (e) {
-            // Если не появилось за 3 секунды, пробуем просто найти
-          }
-          
-          const element = await this.page.$(selector);
-          if (element) {
-            // Проверяем, что элемент видимый
+          phoneInput = await this.page.$(selector);
+          if (phoneInput) {
             const isVisible = await this.page.evaluate((el) => {
               const htmlEl = el as HTMLElement;
               const style = window.getComputedStyle(htmlEl);
               return htmlEl.offsetWidth > 0 && 
                      htmlEl.offsetHeight > 0 && 
                      style.display !== 'none' && 
-                     style.visibility !== 'hidden' &&
-                     style.opacity !== '0';
-            }, element);
+                     style.visibility !== 'hidden';
+            }, phoneInput);
             
             if (isVisible) {
-              phoneInput = element;
-              foundSelector = selector;
-              this.logger.log(`Found phone input with selector: ${selector}`);
+              this.logger.log(`Found phone input: ${selector}`);
               break;
-            } else {
-              this.logger.log(`Element found but not visible: ${selector}`);
             }
+            phoneInput = null;
           }
         } catch (e) {
-          // Продолжаем искать
           continue;
         }
       }
 
-      // Если не нашли стандартными селекторами, пробуем через XPath
       if (!phoneInput) {
-        this.logger.log('Standard selectors failed, trying XPath...');
-        
-        try {
-          const phoneInputs = await this.page.$x(
-            "//input[contains(@placeholder, 'телефон') or contains(@placeholder, 'Телефон') or contains(@placeholder, 'phone') or contains(@placeholder, 'Phone') or contains(@name, 'phone') or contains(@id, 'phone')]"
-          );
-          if (phoneInputs.length > 0) {
-            for (const input of phoneInputs) {
-              const isVisible = await this.page.evaluate((el) => {
-                const htmlEl = el as HTMLElement;
-                const style = window.getComputedStyle(htmlEl);
-                return htmlEl.offsetWidth > 0 && 
-                       htmlEl.offsetHeight > 0 && 
-                       style.display !== 'none' && 
-                       style.visibility !== 'hidden' &&
-                       style.opacity !== '0';
-              }, input);
-              if (isVisible) {
-                phoneInput = input;
-                this.logger.log('Found phone input via XPath');
-                break;
-              }
-            }
-          }
-        } catch (e) {
-          this.logger.warn('XPath search failed:', e);
-        }
+        throw new Error('Phone input field not found on login page');
       }
 
-      // Если все еще не нашли, пробуем найти через анализ всех input полей
-      if (!phoneInput) {
-        this.logger.log('Trying to find phone input by analyzing all inputs...');
-        
-        try {
-          const inputs = await this.page.$$('input');
-          for (const input of inputs) {
-            const inputInfo = await this.page.evaluate((el) => {
-              const htmlEl = el as HTMLInputElement;
-              return {
-                type: htmlEl.type,
-                name: htmlEl.name,
-                id: htmlEl.id,
-                placeholder: htmlEl.placeholder,
-                className: htmlEl.className,
-                autocomplete: htmlEl.getAttribute('autocomplete'),
-                visible: htmlEl.offsetWidth > 0 && htmlEl.offsetHeight > 0,
-              };
-            }, input);
-
-            // Проверяем различные признаки поля телефона
-            const isPhoneField = 
-              inputInfo.type === 'tel' ||
-              inputInfo.name?.toLowerCase().includes('phone') ||
-              inputInfo.id?.toLowerCase().includes('phone') ||
-              inputInfo.placeholder?.toLowerCase().includes('телефон') ||
-              inputInfo.placeholder?.toLowerCase().includes('phone') ||
-              inputInfo.autocomplete?.includes('tel');
-
-            if (isPhoneField && inputInfo.visible) {
-              phoneInput = input;
-              this.logger.log(`Found phone input by analysis: ${JSON.stringify(inputInfo)}`);
-              break;
-            }
-          }
-        } catch (e) {
-          this.logger.warn('Input analysis failed:', e);
-        }
-      }
-
-      // Если все еще не нашли, пробуем первый видимый input (может быть это поле телефона)
-      if (!phoneInput) {
-        this.logger.log('Trying to use first visible input as phone field...');
-        try {
-          const inputs = await this.page.$$('input');
-          for (const input of inputs) {
-            const isVisible = await this.page.evaluate((el) => {
-              const htmlEl = el as HTMLInputElement;
-              const style = window.getComputedStyle(htmlEl);
-              return htmlEl.offsetWidth > 0 && 
-                     htmlEl.offsetHeight > 0 && 
-                     htmlEl.type !== 'hidden' && 
-                     htmlEl.type !== 'submit' && 
-                     htmlEl.type !== 'button' &&
-                     style.display !== 'none' && 
-                     style.visibility !== 'hidden' &&
-                     style.opacity !== '0';
-            }, input);
-            
-            if (isVisible) {
-              phoneInput = input;
-              this.logger.log('Using first visible input as phone field');
-              break;
-            }
-          }
-        } catch (e) {
-          this.logger.warn('Failed to find any visible input:', e);
-        }
-      }
-
-      // Если все еще не нашли, пробуем поискать в iframe
-      if (!phoneInput) {
-        this.logger.log('Trying to find phone input in iframes...');
-        try {
-          const frames = this.page.frames();
-          for (const frame of frames) {
-            if (frame !== this.page.mainFrame()) {
-              try {
-                for (const selector of phoneSelectors.slice(0, 5)) { // Пробуем только основные селекторы
-                  const element = await frame.$(selector);
-                  if (element) {
-                    const isVisible = await frame.evaluate((el) => {
-                      const htmlEl = el as HTMLElement;
-                      const style = window.getComputedStyle(htmlEl);
-                      return htmlEl.offsetWidth > 0 && 
-                             htmlEl.offsetHeight > 0 && 
-                             style.display !== 'none' && 
-                             style.visibility !== 'hidden';
-                    }, element);
-                    if (isVisible) {
-                      phoneInput = element;
-                      this.logger.log(`Found phone input in iframe with selector: ${selector}`);
-                      break;
-                    }
-                  }
-                }
-                if (phoneInput) break;
-              } catch (e) {
-                continue;
-              }
-            }
-          }
-        } catch (e) {
-          this.logger.warn('Error searching in iframes:', e);
-        }
-      }
-      
-      // Если все еще не нашли, пробуем найти через JavaScript напрямую
-      if (!phoneInput) {
-        this.logger.log('Trying to find phone input via direct JavaScript evaluation...');
-        try {
-          const foundInput = await this.page.evaluateHandle(() => {
-            const inputs = Array.from(document.querySelectorAll('input'));
-            for (const input of inputs) {
-              const htmlInput = input as HTMLInputElement;
-              const style = window.getComputedStyle(htmlInput);
-              const isVisible = htmlInput.offsetWidth > 0 && 
-                               htmlInput.offsetHeight > 0 && 
-                               style.display !== 'none' && 
-                               style.visibility !== 'hidden' &&
-                               htmlInput.type !== 'hidden' &&
-                               htmlInput.type !== 'submit' &&
-                               htmlInput.type !== 'button';
-              
-              if (isVisible) {
-                const type = htmlInput.type;
-                const name = htmlInput.name?.toLowerCase() || '';
-                const id = htmlInput.id?.toLowerCase() || '';
-                const placeholder = htmlInput.placeholder?.toLowerCase() || '';
-                const autocomplete = htmlInput.getAttribute('autocomplete')?.toLowerCase() || '';
-                
-                // Проверяем признаки поля телефона
-                if (type === 'tel' ||
-                    name.includes('phone') ||
-                    id.includes('phone') ||
-                    placeholder.includes('телефон') ||
-                    placeholder.includes('phone') ||
-                    autocomplete.includes('tel')) {
-                  return input;
-                }
-              }
-            }
-            // Если не нашли по признакам, возвращаем первый видимый input
-            for (const input of inputs) {
-              const htmlInput = input as HTMLInputElement;
-              const style = window.getComputedStyle(htmlInput);
-              if (htmlInput.offsetWidth > 0 && 
-                  htmlInput.offsetHeight > 0 && 
-                  style.display !== 'none' && 
-                  style.visibility !== 'hidden' &&
-                  htmlInput.type !== 'hidden' &&
-                  htmlInput.type !== 'submit' &&
-                  htmlInput.type !== 'button') {
-                return input;
-              }
-            }
-            return null;
-          });
-          
-          if (foundInput && foundInput.asElement()) {
-            phoneInput = foundInput.asElement();
-            this.logger.log('Found phone input via JavaScript evaluation');
-          }
-        } catch (e) {
-          this.logger.warn('Error in JavaScript evaluation search:', e);
-        }
-      }
-      
-      // Если все еще не нашли, ждем и проверяем, авторизовался ли пользователь вручную
-      if (!phoneInput) {
-        this.logger.warn('Phone input field not found on login page');
-        this.logger.log('Waiting for manual login or form to appear...');
-        
-        // Выводим дополнительную информацию о странице
-        const pageInfo = await this.page.evaluate(() => {
-          return {
-            url: window.location.href,
-            hash: window.location.hash,
-            title: document.title,
-            bodyText: document.body?.textContent?.substring(0, 500) || '',
-            iframeCount: document.querySelectorAll('iframe').length,
-            modalCount: document.querySelectorAll('[class*="modal"], [class*="Modal"]').length,
-          };
-        });
-        this.logger.log('Page info:', JSON.stringify(pageInfo, null, 2));
-        
-        // Делаем скриншот для отладки
-        try {
-          await this.page.screenshot({ path: 'debug-login-page.png', fullPage: true });
-          this.logger.log('Screenshot saved to debug-login-page.png');
-        } catch (e) {
-          this.logger.warn('Failed to save screenshot:', e);
-        }
-
-        // Ждем до 60 секунд, проверяя каждые 3 секунды, авторизовался ли пользователь
-        this.logger.log('Waiting for manual login (up to 60 seconds)...');
-        let loggedIn = false;
-        for (let i = 0; i < 20; i++) {
-          await this.page.waitForTimeout(3000);
-          
-          // Проверяем, авторизовались ли мы
-          loggedIn = await this.checkIfLoggedIn();
-          if (loggedIn) {
-            this.logger.log('User logged in manually! Continuing...');
-            return; // Выходим из метода login, авторизация успешна
-          }
-          
-          // Также проверяем, не появилось ли поле телефона
-          try {
-            phoneInput = await this.page.$('input[type="tel"], input[name*="phone"], input[placeholder*="телефон"], input[placeholder*="Телефон"]');
-            if (phoneInput) {
-              const isVisible = await this.page.evaluate((el) => {
-                const htmlEl = el as HTMLElement;
-                const style = window.getComputedStyle(htmlEl);
-                return htmlEl.offsetWidth > 0 && 
-                       htmlEl.offsetHeight > 0 && 
-                       style.display !== 'none' && 
-                       style.visibility !== 'hidden';
-              }, phoneInput);
-              if (isVisible) {
-                this.logger.log('Phone input appeared! Continuing with automatic login...');
-                break; // Выходим из цикла ожидания, продолжаем автоматический логин
-              }
-            }
-          } catch (e) {
-            // Игнорируем ошибки
-          }
-          
-          this.logger.log(`Waiting for login... (${(i + 1) * 3}/60 seconds)`);
-        }
-        
-        // Если после ожидания все еще не авторизованы и нет поля телефона
-        if (!loggedIn && !phoneInput) {
-          // Проверяем еще раз авторизацию
-          loggedIn = await this.checkIfLoggedIn();
-          if (!loggedIn) {
-            throw new Error('Phone input field not found and user did not login manually within 60 seconds');
-          } else {
-            this.logger.log('User logged in! Continuing...');
-            return;
-          }
-        }
-        
-        // Если все еще не нашли поле, но пользователь не авторизовался, выбрасываем ошибку
-        if (!phoneInput && !loggedIn) {
-          throw new Error('Phone input field not found on login page');
-        }
-      }
-
-      // Вводим телефон
-      // Нормализуем формат телефона (убираем пробелы, дефисы и т.д.)
+      // Вводим телефон - быстрая версия
       const normalizedPhone = phone.replace(/[\s\-\(\)]/g, '');
-      this.logger.log(`Entering phone number: ${normalizedPhone} (original: ${phone})`);
+      this.logger.log(`Entering phone: ${normalizedPhone}`);
       
-      // Фокусируемся на поле и очищаем его
       await phoneInput.click({ clickCount: 3 });
+      await phoneInput.type(normalizedPhone, { delay: 50 });
       await this.page.waitForTimeout(500);
-      
-      // Пробуем очистить поле через клавиатуру
-      await phoneInput.press('Backspace');
-      await this.page.waitForTimeout(200);
-      
-      // Вводим телефон посимвольно с задержкой
-      // Пробуем ввести как есть, если не получится - попробуем без плюса
-      await phoneInput.type(normalizedPhone, { delay: 150 });
-      await this.page.waitForTimeout(2000);
-      
-      // Проверяем, что телефон введен
-      const enteredPhone = await this.page.evaluate((el) => (el as HTMLInputElement).value, phoneInput);
-      this.logger.log(`Entered phone value: ${enteredPhone}`);
-      
-      if (!enteredPhone || enteredPhone.length < 5) {
-        this.logger.warn('Phone was not entered correctly, trying again...');
-        await phoneInput.click({ clickCount: 3 });
-        // Пробуем ввести без плюса, если он был
-        const phoneWithoutPlus = normalizedPhone.startsWith('+') ? normalizedPhone.substring(1) : normalizedPhone;
-        await phoneInput.type(phoneWithoutPlus, { delay: 100 });
-        await this.page.waitForTimeout(1000);
-        
-        // Проверяем еще раз
-        const enteredPhone2 = await this.page.evaluate((el) => (el as HTMLInputElement).value, phoneInput);
-        this.logger.log(`Entered phone value after retry: ${enteredPhone2}`);
-      }
 
-      // Ищем кнопку "Далее" или "Продолжить"
-      const nextButtonSelectors = [
-        'button[type="submit"]',
-        'button[data-marker*="submit"]',
-        'button.button-button-2Fo5k',
-      ];
-
-      // Пробуем найти кнопку через текст
-      let nextButton = null;
+      // Нажимаем кнопку "Далее" или Enter
       try {
-        const buttons = await this.page.$$('button');
-        for (const button of buttons) {
-          const text = await this.page.evaluate(el => el.textContent, button);
-          if (text && (text.includes('Далее') || text.includes('Продолжить') || text.includes('Continue'))) {
-            nextButton = button;
-            this.logger.log('Found next button by text');
-            break;
-          }
+        const nextButton = await this.page.$('button[type="submit"]');
+        if (nextButton) {
+          await nextButton.click();
+        } else {
+          await phoneInput.press('Enter');
         }
       } catch (e) {
-        this.logger.warn('Error searching for next button by text:', e);
-      }
-
-      // Если не нашли по тексту, пробуем селекторы
-      if (!nextButton) {
-        for (const selector of nextButtonSelectors) {
-          try {
-            nextButton = await this.page.$(selector);
-            if (nextButton) {
-              this.logger.log(`Found next button with selector: ${selector}`);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-
-      if (nextButton) {
-        await nextButton.click();
-        this.logger.log('Clicked next/continue button');
-        await this.page.waitForTimeout(3000);
-      } else {
-        // Пробуем нажать Enter на поле телефона
         await phoneInput.press('Enter');
-        this.logger.log('Pressed Enter on phone field');
-        await this.page.waitForTimeout(3000);
       }
-
-      // Вводим пароль
-      this.logger.log('Entering password...');
       
       // Ждем появления поля пароля
-      await this.page.waitForTimeout(2000);
+      await this.page.waitForTimeout(1000);
       
-      // Пробуем найти поле пароля разными способами
-      let passwordInput: puppeteer.ElementHandle<Element> | null = await this.page.$('input[type="password"]');
+      // Находим поле пароля - используем точные селекторы
+      const passwordSelectors = [
+        'input[data-marker="login-form/password/input"]',
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+      ];
       
-      if (!passwordInput) {
-        // Пробуем другие селекторы
-        const passwordSelectors = [
-          'input[type="password"]',
-          'input[name*="password"]',
-          'input[name*="Password"]',
-          'input[id*="password"]',
-          'input[placeholder*="пароль"]',
-          'input[placeholder*="Пароль"]',
-          'input[autocomplete="current-password"]',
-        ];
-        
-        for (const selector of passwordSelectors) {
-          try {
-            passwordInput = await this.page.$(selector);
-            if (passwordInput) {
-              const isVisible = await this.page.evaluate((el) => {
-                const htmlEl = el as HTMLElement;
-                return htmlEl.offsetWidth > 0 && htmlEl.offsetHeight > 0;
-              }, passwordInput);
-              if (isVisible) {
-                this.logger.log(`Found password input with selector: ${selector}`);
-                break;
-              }
+      let passwordInput: puppeteer.ElementHandle<Element> | null = null;
+      for (const selector of passwordSelectors) {
+        try {
+          passwordInput = await this.page.$(selector);
+          if (passwordInput) {
+            const isVisible = await this.page.evaluate((el) => {
+              const htmlEl = el as HTMLElement;
+              return htmlEl.offsetWidth > 0 && htmlEl.offsetHeight > 0;
+            }, passwordInput);
+            if (isVisible) {
+              this.logger.log(`Found password input: ${selector}`);
+              break;
             }
-          } catch (e) {
-            continue;
+            passwordInput = null;
           }
+        } catch (e) {
+          continue;
         }
       }
       
       if (!passwordInput) {
-        // Может быть уже авторизовались или нужен код подтверждения
-        this.logger.warn('Password input not found, checking if already logged in...');
-        await this.page.waitForTimeout(3000);
+        // Проверяем, может уже авторизовались
         const url = this.page.url();
         if (url.includes('/profile') || url.includes('/cabinet') || url.includes('/messenger')) {
           this.logger.log('Already logged in after phone entry');
-          return;
+          return { requiresSms: false };
         }
         
-        // Проверяем, не появилось ли поле для кода подтверждения
-        const codeInput = await this.page.$('input[type="text"], input[type="number"]');
-        if (codeInput) {
-          const placeholder = await this.page.evaluate((el) => (el as HTMLInputElement).placeholder, codeInput);
-          if (placeholder && (placeholder.includes('код') || placeholder.includes('code'))) {
-            this.logger.warn('SMS code input detected. Manual intervention may be required.');
-            throw new Error('SMS code verification required. Please check the browser window.');
+        // Проверяем, не появилось ли поле для SMS-кода
+        const smsCodeInput = await this.page.$('input[type="text"], input[type="number"], input[placeholder*="код"], input[placeholder*="Код"]');
+        if (smsCodeInput) {
+          const placeholder = await this.page.evaluate((el) => (el as HTMLInputElement).placeholder || '', smsCodeInput);
+          const dataMarker = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('data-marker') || '', smsCodeInput);
+          
+          if (placeholder.includes('код') || placeholder.includes('code') || dataMarker.includes('code') || dataMarker.includes('sms')) {
+            this.logger.log('SMS code required');
+            return { requiresSms: true };
           }
+        }
+        
+        // Проверяем наличие ошибок на странице
+        const errorText = await this.page.evaluate(() => {
+          const errorElements = document.querySelectorAll('[class*="error"], [class*="Error"], [class*="invalid"], [class*="Invalid"]');
+          for (const el of Array.from(errorElements)) {
+            const text = el.textContent || '';
+            if (text && (text.includes('неверн') || text.includes('неправильн') || text.includes('ошибк') || text.includes('error'))) {
+              return text.trim();
+            }
+          }
+          return null;
+        });
+        
+        if (errorText) {
+          return { requiresSms: false, error: errorText };
         }
         
         throw new Error('Password input field not found');
       }
 
-      // Вводим пароль
+      // Вводим пароль - быстрая версия
+      this.logger.log('Entering password...');
       await passwordInput.click({ clickCount: 3 });
-      await this.page.waitForTimeout(300);
-      await passwordInput.type(password, { delay: 100 });
-      await this.page.waitForTimeout(1500);
+      await passwordInput.type(password, { delay: 50 });
+      await this.page.waitForTimeout(500);
+      
+      // Делаем пароль видимым, изменяя тип поля на text
+      await this.page.evaluate((el) => {
+        (el as HTMLInputElement).type = 'text';
+      }, passwordInput);
+      this.logger.log('Password field changed to visible (text type)');
 
       // Нажимаем кнопку входа
-      const submitButtonSelectors = [
-        'button[type="submit"]',
-        'button[data-marker*="submit"]',
-      ];
-
-      let submitButton = null;
-      
-      // Пробуем найти по тексту
       try {
-        const buttons = await this.page.$$('button');
-        for (const button of buttons) {
-          const text = await this.page.evaluate(el => el.textContent, button);
-          if (text && (text.includes('Войти') || text.includes('Вход') || text.includes('Login'))) {
-            submitButton = button;
-            this.logger.log('Found submit button by text');
-            break;
-          }
-        }
-      } catch (e) {
-        this.logger.warn('Error searching for submit button by text:', e);
-      }
-
-      // Если не нашли по тексту, пробуем селекторы
-      if (!submitButton) {
-        for (const selector of submitButtonSelectors) {
-          try {
-            submitButton = await this.page.$(selector);
-            if (submitButton) {
-              this.logger.log(`Found submit button with selector: ${selector}`);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-
-      if (submitButton) {
-        await submitButton.click();
-        this.logger.log('Clicked submit/login button');
-      } else {
-        // Пробуем нажать Enter
-        await passwordInput.press('Enter');
-        this.logger.log('Pressed Enter on password field');
-      }
-
-      // Ждём завершения авторизации
-      this.logger.log('Waiting for login to complete...');
-      try {
-        await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 });
-      } catch (e) {
-        // Иногда навигация не происходит, но мы уже на нужной странице
-        this.logger.warn('Navigation timeout, but continuing...');
-        await this.page.waitForTimeout(3000);
-      }
-      
-      // Проверяем, что авторизация прошла успешно
-      await this.page.waitForTimeout(2000);
-      const isLoggedIn = await this.checkIfLoggedIn();
-      
-      if (!isLoggedIn) {
-        this.logger.warn('Login may not have completed successfully, waiting and checking again...');
-        // Ждем еще немного и проверяем снова
-        await this.page.waitForTimeout(5000);
-        const isLoggedInRetry = await this.checkIfLoggedIn();
-        
-        if (!isLoggedInRetry) {
-          const url = this.page.url();
-          this.logger.log(`Current URL: ${url}`);
-          this.logger.warn('Login verification failed, but continuing - user may have logged in manually');
+        const submitButton = await this.page.$('button[type="submit"]');
+        if (submitButton) {
+          await submitButton.click();
         } else {
-          this.logger.log('Login verified successfully on retry');
+          await passwordInput.press('Enter');
+        }
+      } catch (e) {
+        await passwordInput.press('Enter');
+      }
+
+      // Ждём ответа от сервера
+      this.logger.log('Waiting for login response...');
+      await this.page.waitForTimeout(3000);
+      
+      // ВАЖНО: Сначала проверяем, не появилось ли поле для SMS-кода
+      // Используем более широкий поиск для надежности
+      let smsCodeInput = await this.page.$('input[type="text"], input[type="number"], input[placeholder*="код"], input[placeholder*="Код"], input[data-marker*="code"], input[data-marker*="sms"]');
+      
+      // Если не нашли сразу, ждем еще немного и проверяем снова
+      if (!smsCodeInput) {
+        await this.page.waitForTimeout(1000);
+        smsCodeInput = await this.page.$('input[type="text"], input[type="number"], input[placeholder*="код"], input[placeholder*="Код"], input[data-marker*="code"], input[data-marker*="sms"]');
+      }
+      
+      if (smsCodeInput) {
+        const placeholder = await this.page.evaluate((el) => (el as HTMLInputElement).placeholder || '', smsCodeInput);
+        const dataMarker = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('data-marker') || '', smsCodeInput);
+        const inputType = await this.page.evaluate((el) => (el as HTMLInputElement).type || '', smsCodeInput);
+        
+        // Проверяем, что это действительно поле для SMS-кода
+        const isSmsField = placeholder.includes('код') || 
+                          placeholder.includes('code') || 
+                          placeholder.includes('Код') ||
+                          dataMarker.includes('code') || 
+                          dataMarker.includes('sms') ||
+                          dataMarker.includes('Code') ||
+                          dataMarker.includes('SMS');
+        
+        if (isSmsField) {
+          this.logger.log('SMS code required after password');
+          
+          // Если SMS-код передан, вводим его
+          if (smsCode) {
+            this.logger.log('Entering SMS code...');
+            await smsCodeInput.click({ clickCount: 3 });
+            await smsCodeInput.type(smsCode, { delay: 50 });
+            await this.page.waitForTimeout(500);
+            
+            // Нажимаем кнопку подтверждения
+            try {
+              const confirmButton = await this.page.$('button[type="submit"]');
+              if (confirmButton) {
+                await confirmButton.click();
+              } else {
+                await smsCodeInput.press('Enter');
+              }
+            } catch (e) {
+              await smsCodeInput.press('Enter');
+            }
+            
+            await this.page.waitForTimeout(2000);
+            
+            // Проверяем, не появилась ли ошибка
+            const errorText = await this.page.evaluate(() => {
+              const errorElements = document.querySelectorAll('[class*="error"], [class*="Error"], [class*="invalid"], [class*="Invalid"]');
+              for (const el of Array.from(errorElements)) {
+                const text = el.textContent || '';
+                if (text && (text.includes('неверн') || text.includes('неправильн') || text.includes('ошибк') || text.includes('error'))) {
+                  return text.trim();
+                }
+              }
+              return null;
+            });
+            
+            if (errorText) {
+              return { requiresSms: true, error: errorText };
+            }
+            
+            // Проверяем авторизацию после ввода SMS-кода
+            const isLoggedInAfterSms = await this.checkIfLoggedIn();
+            if (!isLoggedInAfterSms) {
+              // Если все еще требуется SMS-код, значит код был неверный
+              await this.page.waitForTimeout(1000);
+              const smsCodeInputStillPresent = await this.page.$('input[type="text"], input[type="number"], input[placeholder*="код"], input[placeholder*="Код"], input[data-marker*="code"], input[data-marker*="sms"]');
+              if (smsCodeInputStillPresent) {
+                const placeholderStill = await this.page.evaluate((el) => (el as HTMLInputElement).placeholder || '', smsCodeInputStillPresent);
+                const dataMarkerStill = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('data-marker') || '', smsCodeInputStillPresent);
+                if (placeholderStill.includes('код') || placeholderStill.includes('code') || dataMarkerStill.includes('code') || dataMarkerStill.includes('sms')) {
+                  return { requiresSms: true, error: 'Неверный SMS-код. Введите код заново.' };
+                }
+              }
+            } else {
+              this.logger.log('Login verified successfully after SMS code');
+            }
+          } else {
+            // SMS-код не передан, возвращаем требование
+            return { requiresSms: true };
+          }
+        }
+      }
+      
+      // Проверяем наличие ошибок на странице
+      const errorText = await this.page.evaluate(() => {
+        const errorElements = document.querySelectorAll('[class*="error"], [class*="Error"], [class*="invalid"], [class*="Invalid"]');
+        for (const el of Array.from(errorElements)) {
+          const text = el.textContent || '';
+          if (text && (text.includes('неверн') || text.includes('неправильн') || text.includes('ошибк') || text.includes('error'))) {
+            return text.trim();
+          }
+        }
+        return null;
+      });
+      
+      if (errorText) {
+        return { requiresSms: false, error: errorText };
+      }
+      
+      // Проверяем авторизацию
+      const isLoggedIn = await this.checkIfLoggedIn();
+      if (!isLoggedIn) {
+        // Даем еще немного времени
+        await this.page.waitForTimeout(2000);
+        
+        // ПЕРЕД проверкой ошибок, проверяем, не появилось ли поле для SMS-кода
+        const smsCodeInputCheck = await this.page.$('input[type="text"], input[type="number"], input[placeholder*="код"], input[placeholder*="Код"]');
+        if (smsCodeInputCheck) {
+          const placeholder = await this.page.evaluate((el) => (el as HTMLInputElement).placeholder || '', smsCodeInputCheck);
+          const dataMarker = await this.page.evaluate((el) => (el as HTMLElement).getAttribute('data-marker') || '', smsCodeInputCheck);
+          
+          if (placeholder.includes('код') || placeholder.includes('code') || dataMarker.includes('code') || dataMarker.includes('sms')) {
+            this.logger.log('SMS code required (detected after password check)');
+            if (!smsCode) {
+              return { requiresSms: true };
+            }
+            // Если SMS-код уже был введен, но все еще требуется, значит он неверный
+            return { requiresSms: true, error: 'Неверный SMS-код. Введите код заново.' };
+          }
+        }
+        
+        const isLoggedInRetry = await this.checkIfLoggedIn();
+        if (!isLoggedInRetry) {
+          // Проверяем еще раз ошибки
+          const finalErrorText = await this.page.evaluate(() => {
+            const errorElements = document.querySelectorAll('[class*="error"], [class*="Error"], [class*="invalid"], [class*="Invalid"]');
+            for (const el of Array.from(errorElements)) {
+              const text = el.textContent || '';
+              if (text && (text.includes('неверн') || text.includes('неправильн') || text.includes('ошибк') || text.includes('error'))) {
+                return text.trim();
+              }
+            }
+            return null;
+          });
+          
+          if (finalErrorText) {
+            return { requiresSms: false, error: finalErrorText };
+          }
+          
+          return { requiresSms: false, error: 'Авторизация не удалась. Проверьте правильность данных.' };
+        } else {
+          this.logger.log('Login verified successfully');
         }
       } else {
         this.logger.log('Login verified successfully');
       }
+      
+      return { requiresSms: false };
 
       this.logger.log('Login process completed');
+      return { requiresSms: false };
     } catch (error) {
       this.logger.error('Error during login:', error);
       
@@ -1001,7 +669,7 @@ export class PuppeteerService implements OnModuleDestroy {
         }
       }
       
-      throw error;
+      return { requiresSms: false, error: error.message || 'Ошибка при авторизации' };
     }
   }
 

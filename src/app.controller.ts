@@ -25,9 +25,15 @@ export class AppController {
   }
 
   @Post('start')
-  async startMonitoring() {
+  async startMonitoring(@Body() body: { phone?: string; password?: string; smsCode?: string }) {
     try {
-      await this.puppeteerService.startMonitoring();
+      const result = await this.puppeteerService.startMonitoring(body.phone, body.password, body.smsCode);
+      if (result.error) {
+        return { success: false, error: result.error, requiresSms: result.requiresSms };
+      }
+      if (result.requiresSms) {
+        return { success: false, requiresSms: true, message: 'Требуется SMS-код' };
+      }
       return { success: true, message: 'Monitoring started' };
     } catch (error) {
       return { success: false, error: error.message };

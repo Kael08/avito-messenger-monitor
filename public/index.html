@@ -106,6 +106,68 @@
       color: white;
     }
 
+    .form-group {
+      margin-bottom: 15px;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 5px;
+      color: #333;
+      font-weight: 500;
+      font-size: 14px;
+    }
+
+    .form-group input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 14px;
+      transition: border-color 0.3s;
+    }
+
+    .form-group input:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+
+    .form-group input[type="password"] {
+      font-family: monospace;
+    }
+
+    .password-wrapper {
+      position: relative;
+    }
+
+    .password-toggle {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 5px;
+      color: #666;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      transition: color 0.3s;
+    }
+
+    .password-toggle:hover {
+      color: #333;
+    }
+
+    .password-toggle:focus {
+      outline: none;
+    }
+
     .messages-container {
       padding: 20px;
       max-height: 600px;
@@ -203,11 +265,56 @@
     </div>
 
     <div class="controls">
-      <div class="button-group">
-        <button class="btn-start" onclick="startMonitoring()">Запустить мониторинг</button>
-        <button class="btn-stop" onclick="stopMonitoring()">Остановить</button>
-      </div>
-      <p class="info-text">Откроется браузер - авторизуйтесь в Авито вручную, затем перейдите в мессенджер</p>
+      <form id="loginForm" onsubmit="event.preventDefault(); startMonitoring();">
+        <div class="form-group">
+          <label for="phone">Телефон:</label>
+          <input 
+            type="tel" 
+            id="phone" 
+            name="phone" 
+            placeholder="+79001234567 или 89001234567" 
+            required
+          />
+        </div>
+        <div class="form-group">
+          <label for="password">Пароль:</label>
+          <div class="password-wrapper">
+            <input 
+              type="password" 
+              id="password" 
+              name="password" 
+              placeholder="Введите пароль от аккаунта Авито" 
+              required
+              style="padding-right: 45px;"
+            />
+            <button 
+              type="button" 
+              class="password-toggle" 
+              id="passwordToggle"
+              onclick="togglePasswordVisibility()"
+              title="Показать/скрыть пароль"
+            >
+              👁️
+            </button>
+          </div>
+        </div>
+        <div class="form-group" id="smsCodeGroup" style="display: none;">
+          <label for="smsCode">SMS-код:</label>
+          <input 
+            type="text" 
+            id="smsCode" 
+            name="smsCode" 
+            placeholder="Введите код из SMS" 
+            maxlength="6"
+          />
+        </div>
+        <div id="errorMessage" style="display: none; color: #f44336; margin-bottom: 15px; padding: 10px; background: #ffebee; border-radius: 6px; font-size: 14px;"></div>
+        <div class="button-group">
+          <button type="submit" class="btn-start" id="submitButton">Запустить мониторинг</button>
+          <button type="button" class="btn-stop" onclick="stopMonitoring()">Остановить</button>
+        </div>
+      </form>
+      <p class="info-text">Введите данные для автоматической авторизации в Авито</p>
     </div>
 
     <div class="messages-container" id="messagesContainer">
@@ -221,7 +328,8 @@
   </div>
 
   <script>
-    const socket = io('http://localhost:3000');
+    const serverUrl = window.location.origin;
+    const socket = io(serverUrl);
     const messagesContainer = document.getElementById('messagesContainer');
     const statusElement = document.getElementById('status');
     let isMonitoring = false;
@@ -328,29 +436,99 @@
 
     async function startMonitoring() {
       try {
-        const response = await fetch('http://localhost:3000/start', {
+        // Получаем значения из формы
+        const phoneInput = document.getElementById('phone');
+        const passwordInput = document.getElementById('password');
+        const smsCodeInput = document.getElementById('smsCode');
+        const smsCodeGroup = document.getElementById('smsCodeGroup');
+        const errorMessage = document.getElementById('errorMessage');
+        const submitButton = document.getElementById('submitButton');
+        
+        const phone = phoneInput.value.trim();
+        const password = passwordInput.value.trim();
+        const smsCode = smsCodeInput.value.trim();
+
+        if (!phone || !password) {
+          showError('Пожалуйста, заполните телефон и пароль');
+          return;
+        }
+
+        // Скрываем предыдущие ошибки
+        hideError();
+
+        const response = await fetch(`${serverUrl}/start`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
+          body: JSON.stringify({
+            phone: phone,
+            password: password,
+            smsCode: smsCode || undefined,
+          }),
         });
 
         const result = await response.json();
         if (result.success) {
-          alert('Мониторинг запущен! Откройте браузер и авторизуйтесь в Авито вручную, затем перейдите в мессенджер.');
+          alert('Мониторинг запущен! Выполняется автоматическая авторизация в Авито...');
           isMonitoring = true;
+          // Делаем поля неактивными во время работы
+          phoneInput.disabled = true;
+          passwordInput.disabled = true;
+          smsCodeInput.disabled = true;
+          smsCodeGroup.style.display = 'none';
+          hideError();
         } else {
-          alert('Ошибка запуска: ' + (result.error || 'Неизвестная ошибка'));
+          if (result.requiresSms) {
+            // Показываем поле для SMS-кода
+            smsCodeGroup.style.display = 'block';
+            smsCodeInput.required = true;
+            submitButton.textContent = 'Подтвердить SMS-код';
+            showError('Введите SMS-код, отправленный на ваш телефон');
+            smsCodeInput.focus();
+          } else {
+            // Показываем ошибку
+            showError(result.error || 'Ошибка при авторизации');
+            smsCodeGroup.style.display = 'none';
+            smsCodeInput.required = false;
+            submitButton.textContent = 'Запустить мониторинг';
+          }
         }
       } catch (error) {
         console.error('Error starting monitoring:', error);
-        alert('Ошибка при запуске мониторинга: ' + error.message);
+        showError('Ошибка при запуске мониторинга: ' + error.message);
+      }
+    }
+
+    function showError(message) {
+      const errorMessage = document.getElementById('errorMessage');
+      errorMessage.textContent = message;
+      errorMessage.style.display = 'block';
+    }
+
+    function hideError() {
+      const errorMessage = document.getElementById('errorMessage');
+      errorMessage.style.display = 'none';
+    }
+
+    function togglePasswordVisibility() {
+      const passwordInput = document.getElementById('password');
+      const passwordToggle = document.getElementById('passwordToggle');
+      
+      if (passwordInput.type === 'password') {
+        passwordInput.type = 'text';
+        passwordToggle.textContent = '🙈';
+        passwordToggle.title = 'Скрыть пароль';
+      } else {
+        passwordInput.type = 'password';
+        passwordToggle.textContent = '👁️';
+        passwordToggle.title = 'Показать пароль';
       }
     }
 
     async function stopMonitoring() {
       try {
-        const response = await fetch('http://localhost:3000/stop', {
+        const response = await fetch(`${serverUrl}/stop`, {
           method: 'POST',
         });
 
@@ -358,6 +536,19 @@
         if (result.success) {
           alert('Мониторинг остановлен');
           isMonitoring = false;
+          // Включаем поля обратно
+          const phoneInput = document.getElementById('phone');
+          const passwordInput = document.getElementById('password');
+          const smsCodeInput = document.getElementById('smsCode');
+          const smsCodeGroup = document.getElementById('smsCodeGroup');
+          const submitButton = document.getElementById('submitButton');
+          
+          phoneInput.disabled = false;
+          passwordInput.disabled = false;
+          smsCodeInput.disabled = false;
+          smsCodeGroup.style.display = 'none';
+          submitButton.textContent = 'Запустить мониторинг';
+          hideError();
         } else {
           alert('Ошибка остановки: ' + (result.error || 'Неизвестная ошибка'));
         }
