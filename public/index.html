@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Avito Messenger Monitor</title>
+  <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+      overflow: hidden;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 30px;
+      text-align: center;
+    }
+
+    .header h1 {
+      font-size: 28px;
+      margin-bottom: 10px;
+    }
+
+    .status {
+      display: inline-block;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 500;
+      margin-top: 10px;
+    }
+
+    .status.connected {
+      background: rgba(76, 175, 80, 0.3);
+      color: #4caf50;
+    }
+
+    .status.disconnected {
+      background: rgba(244, 67, 54, 0.3);
+      color: #f44336;
+    }
+
+    .controls {
+      padding: 20px;
+      background: #f5f5f5;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .info-text {
+      margin-top: 10px;
+      color: #666;
+      font-size: 14px;
+      text-align: center;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 10px;
+    }
+
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    .btn-start {
+      background: #4caf50;
+      color: white;
+    }
+
+    .btn-stop {
+      background: #f44336;
+      color: white;
+    }
+
+    .messages-container {
+      padding: 20px;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+
+    .messages-container::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .messages-container::-webkit-scrollbar-track {
+      background: #f1f1f1;
+    }
+
+    .messages-container::-webkit-scrollbar-thumb {
+      background: #888;
+      border-radius: 4px;
+    }
+
+    .message {
+      background: #f9f9f9;
+      border-left: 4px solid #667eea;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 6px;
+      animation: slideIn 0.3s ease-out;
+    }
+
+    @keyframes slideIn {
+      from {
+        opacity: 0;
+        transform: translateX(-20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .message-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .message-sender-info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .message-phone {
+      font-size: 12px;
+      color: #666;
+      font-weight: normal;
+    }
+
+    .message-sender {
+      font-weight: 600;
+      color: #667eea;
+      font-size: 16px;
+    }
+
+    .message-time {
+      color: #999;
+      font-size: 12px;
+    }
+
+    .message-text {
+      color: #333;
+      line-height: 1.6;
+      word-wrap: break-word;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #999;
+    }
+
+    .empty-state svg {
+      width: 64px;
+      height: 64px;
+      margin-bottom: 20px;
+      opacity: 0.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>📨 Avito Messenger Monitor</h1>
+      <div id="status" class="status disconnected">Отключено</div>
+    </div>
+
+    <div class="controls">
+      <div class="button-group">
+        <button class="btn-start" onclick="startMonitoring()">Запустить мониторинг</button>
+        <button class="btn-stop" onclick="stopMonitoring()">Остановить</button>
+      </div>
+      <p class="info-text">Откроется браузер - авторизуйтесь в Авито вручную, затем перейдите в мессенджер</p>
+    </div>
+
+    <div class="messages-container" id="messagesContainer">
+      <div class="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+        </svg>
+        <p>Сообщения будут отображаться здесь</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io('http://localhost:3000');
+    const messagesContainer = document.getElementById('messagesContainer');
+    const statusElement = document.getElementById('status');
+    let isMonitoring = false;
+
+    socket.on('connect', () => {
+      console.log('Connected to WebSocket server');
+      updateStatus(true);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Disconnected from WebSocket server');
+      updateStatus(false);
+    });
+
+    socket.on('allMessages', (messages) => {
+      console.log('Received all messages:', messages);
+      if (messages && messages.length > 0) {
+        messagesContainer.innerHTML = '';
+        messages.forEach(message => addMessageToUI(message));
+      }
+    });
+
+    socket.on('newMessage', (message) => {
+      console.log('New message received:', message);
+      addMessageToUI(message);
+      
+      // Если это не системное сообщение и есть номер телефона, обновляем статус
+      if (message.sender !== 'Система' && message.phoneNumber) {
+        updateStatus('monitoring', `Мониторинг активен. Получено сообщение от ${message.phoneNumber}`);
+      }
+    });
+
+    socket.on('monitoringStatus', (status) => {
+      console.log('Monitoring status:', status);
+      if (status.isRunning) {
+        updateStatus('monitoring', status.message || 'Мониторинг активен');
+      }
+    });
+
+    socket.on('pong', (data) => {
+      console.log('Pong received:', data);
+    });
+
+    function updateStatus(connected, message) {
+      if (typeof connected === 'string') {
+        // Новый формат: updateStatus('monitoring', 'message')
+        statusElement.textContent = message || connected;
+        statusElement.className = 'status connected';
+        return;
+      }
+      
+      if (connected) {
+        statusElement.textContent = message || 'Подключено';
+        statusElement.className = 'status connected';
+      } else {
+        statusElement.textContent = 'Отключено';
+        statusElement.className = 'status disconnected';
+      }
+    }
+
+    function addMessageToUI(message) {
+      // Убираем empty state если он есть
+      const emptyState = messagesContainer.querySelector('.empty-state');
+      if (emptyState) {
+        emptyState.remove();
+      }
+
+      const messageDiv = document.createElement('div');
+      messageDiv.className = 'message';
+      
+      const date = new Date(message.timestamp);
+      const timeString = date.toLocaleString('ru-RU', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+
+      const phoneNumber = message.phoneNumber ? `<span class="message-phone">📱 ${escapeHtml(message.phoneNumber)}</span>` : '';
+      messageDiv.innerHTML = `
+        <div class="message-header">
+          <div class="message-sender-info">
+            <span class="message-sender">${escapeHtml(message.sender)}</span>
+            ${phoneNumber}
+          </div>
+          <span class="message-time">${timeString}</span>
+        </div>
+        <div class="message-text">${escapeHtml(message.text)}</div>
+      `;
+
+      messagesContainer.insertBefore(messageDiv, messagesContainer.firstChild);
+
+      // Прокручиваем вверх к новому сообщению
+      messagesContainer.scrollTop = 0;
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function startMonitoring() {
+      try {
+        const response = await fetch('http://localhost:3000/start', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+
+        const result = await response.json();
+        if (result.success) {
+          alert('Мониторинг запущен! Откройте браузер и авторизуйтесь в Авито вручную, затем перейдите в мессенджер.');
+          isMonitoring = true;
+        } else {
+          alert('Ошибка запуска: ' + (result.error || 'Неизвестная ошибка'));
+        }
+      } catch (error) {
+        console.error('Error starting monitoring:', error);
+        alert('Ошибка при запуске мониторинга: ' + error.message);
+      }
+    }
+
+    async function stopMonitoring() {
+      try {
+        const response = await fetch('http://localhost:3000/stop', {
+          method: 'POST',
+        });
+
+        const result = await response.json();
+        if (result.success) {
+          alert('Мониторинг остановлен');
+          isMonitoring = false;
+        } else {
+          alert('Ошибка остановки: ' + (result.error || 'Неизвестная ошибка'));
+        }
+      } catch (error) {
+        console.error('Error stopping monitoring:', error);
+        alert('Ошибка при остановке мониторинга: ' + error.message);
+      }
+    }
+
+    // Проверяем статус при загрузке страницы
+    socket.emit('ping');
+  </script>
+</body>
+</html>
